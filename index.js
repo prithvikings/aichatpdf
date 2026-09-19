@@ -138,7 +138,7 @@ app.post("/upload", upload.single("pdf"), async (req, res) => {
 
         await qdrant.createCollection("pdf-docs", {
             vectors: {
-                size: 768,
+                size: 3072,
                 distance: "Cosine",
             },
         });
@@ -226,7 +226,7 @@ app.post("/upload", upload.single("pdf"), async (req, res) => {
         // ----------------------------------------------
 
         const response = await ai.models.generateContent({
-            model: "gemini-3.8-flash",
+            model: "gemini-3.5-flash-lite",
 
             contents: `
 Answer the question using only the context provided below.
@@ -263,13 +263,13 @@ ${question}
 
 // --------------------------------------------------
 // Create collection manually
-// --------------------------------------------------
+// -----------------------------------------------
 
 app.post("/create-collection", async (req, res) => {
     try {
         await qdrant.createCollection("pdf-docs", {
             vectors: {
-                size: 768,
+                size: 3072,
                 distance: "Cosine",
             },
         });

@@ -13,16 +13,16 @@ const app = express();
 app.use(express.json());
 
 const upload = multer({
-    dest: "uploads/",
+  dest: "uploads/",
 });
 
 const ai = new GoogleGenAI({
-    apiKey: process.env.GEMINI_API_KEY,
+  apiKey: process.env.GEMINI_API_KEY,
 });
 
 const qdrant = new QdrantClient({
-    url: process.env.QDRANT_URL,
-    apiKey: process.env.QDRANT_API_KEY,
+  url: process.env.QDRANT_URL,
+  apiKey: process.env.QDRANT_API_KEY,
 });
 
 // --------------------------------------------------
@@ -30,12 +30,12 @@ const qdrant = new QdrantClient({
 // --------------------------------------------------
 
 async function createEmbedding(text) {
-    const response = await ai.models.embedContent({
-        model: "gemini-embedding-2",
-        contents: text,
-    });
+  const response = await ai.models.embedContent({
+    model: "gemini-embedding-2",
+    contents: text,
+  });
 
-    return response.embeddings[0].values;
+  return response.embeddings[0].values;
 }
 
 // --------------------------------------------------
@@ -43,19 +43,19 @@ async function createEmbedding(text) {
 // --------------------------------------------------
 
 async function extractPdfText(filePath) {
-    const dataBuffer = fs.readFileSync(filePath);
+  const dataBuffer = fs.readFileSync(filePath);
 
-    const parser = new PDFParse({
-        data: dataBuffer,
-    });
+  const parser = new PDFParse({
+    data: dataBuffer,
+  });
 
-    try {
-        const pdfData = await parser.getText();
+  try {
+    const pdfData = await parser.getText();
 
-        return pdfData.text;
-    } finally {
-        await parser.destroy();
-    }
+    return pdfData.text;
+  } finally {
+    await parser.destroy();
+  }
 }
 
 // --------------------------------------------------
@@ -63,172 +63,157 @@ async function extractPdfText(filePath) {
 // --------------------------------------------------
 
 app.post("/upload", upload.single("pdf"), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).send("No PDF uploaded.");
+    }
+
+    // ----------------------------------------------
+    // 1. Extract PDF text
+    // ----------------------------------------------
+
+    let rawText = await extractPdfText(req.file.path);
+
+    // ----------------------------------------------
+    // 2. Delete temporary uploaded PDF
+    // ----------------------------------------------
+
+    if (fs.existsSync(req.file.path)) {
+      fs.unlinkSync(req.file.path);
+    }
+
+    // ----------------------------------------------
+    // 3. Clean PDF text
+    // ----------------------------------------------
+
+    rawText = rawText.replace(/[-–—]\s*\d+\s*of\s*\d+\s*[-–—]/gi, " ");
+
+    rawText = rawText.replace(/Page\s*\d+/gi, " ");
+
+    // ----------------------------------------------
+    // 4. Split into words
+    // ----------------------------------------------
+
+    const words = rawText.split(/\s+/).filter((word) => word.trim() !== "");
+
+    // ----------------------------------------------
+    // 5. Create chunks
+    // ----------------------------------------------
+
+    const chunks = [];
+
+    const chunkSize = 100;
+
+    for (let i = 0; i < words.length; i += chunkSize) {
+      const chunk = words.slice(i, i + chunkSize).join(" ");
+
+      chunks.push(chunk);
+    }
+
+    if (chunks.length === 0) {
+      return res.status(400).send("PDF contains no readable text.");
+    }
+
+    console.log(`Extracted ${words.length} words`);
+    console.log(`Created ${chunks.length} chunks`);
+
+    // ----------------------------------------------
+    // 6. Recreate Qdrant collection
+    // ----------------------------------------------
+
     try {
-        if (!req.file) {
-            return res.status(400).send("No PDF uploaded.");
-        }
+      await qdrant.deleteCollection("pdf-docs");
+    } catch (error) {
+      // Collection may not exist yet.
+    }
 
-        // ----------------------------------------------
-        // 1. Extract PDF text
-        // ----------------------------------------------
+    await qdrant.createCollection("pdf-docs", {
+      vectors: {
+        size: 3072,
+        distance: "Cosine",
+      },
+    });
 
-        let rawText = await extractPdfText(req.file.path);
+    // ----------------------------------------------
+    // 7. Create embeddings
+    // ----------------------------------------------
 
-        // ----------------------------------------------
-        // 2. Delete temporary uploaded PDF
-        // ----------------------------------------------
+    const embeddingPromises = chunks.map(async (chunk) => {
+      const embedding = await createEmbedding(chunk);
 
-        if (fs.existsSync(req.file.path)) {
-            fs.unlinkSync(req.file.path);
-        }
+      return {
+        id: crypto.randomUUID(),
 
-        // ----------------------------------------------
-        // 3. Clean PDF text
-        // ----------------------------------------------
+        vector: embedding,
 
-        rawText = rawText.replace(
-            /[-–—]\s*\d+\s*of\s*\d+\s*[-–—]/gi,
-            " "
-        );
+        payload: {
+          text: chunk,
+        },
+      };
+    });
 
-        rawText = rawText.replace(/Page\s*\d+/gi, " ");
+    const points = await Promise.all(embeddingPromises);
 
-        // ----------------------------------------------
-        // 4. Split into words
-        // ----------------------------------------------
+    console.log(`Generated ${points.length} embeddings`);
 
-        const words = rawText
-            .split(/\s+/)
-            .filter((word) => word.trim() !== "");
+    // ----------------------------------------------
+    // 8. Store embeddings in Qdrant
+    // ----------------------------------------------
 
-        // ----------------------------------------------
-        // 5. Create chunks
-        // ----------------------------------------------
+    await qdrant.upsert("pdf-docs", {
+      wait: true,
+      points,
+    });
 
-        const chunks = [];
+    console.log("Embeddings stored in Qdrant");
 
-        const chunkSize = 100;
+    // ----------------------------------------------
+    // 9. Get user's question
+    // ----------------------------------------------
 
-        for (let i = 0; i < words.length; i += chunkSize) {
-            const chunk = words
-                .slice(i, i + chunkSize)
-                .join(" ");
+    const question = req.body.question;
 
-            chunks.push(chunk);
-        }
+    if (!question) {
+      return res.status(400).send("No question provided.");
+    }
 
-        if (chunks.length === 0) {
-            return res
-                .status(400)
-                .send("PDF contains no readable text.");
-        }
+    // ----------------------------------------------
+    // 10. Create embedding for question
+    // ----------------------------------------------
 
-        console.log(`Extracted ${words.length} words`);
-        console.log(`Created ${chunks.length} chunks`);
+    const questionEmbedding = await createEmbedding(question);
 
-        // ----------------------------------------------
-        // 6. Recreate Qdrant collection
-        // ----------------------------------------------
+    // ----------------------------------------------
+    // 11. Search Qdrant
+    // ----------------------------------------------
 
-        try {
-            await qdrant.deleteCollection("pdf-docs");
-        } catch (error) {
-            // Collection may not exist yet.
-        }
+    const searchResult = await qdrant.query("pdf-docs", {
+      query: questionEmbedding,
+      limit: 1,
+      with_payload: true,
+    });
 
-        await qdrant.createCollection("pdf-docs", {
-            vectors: {
-                size: 3072,
-                distance: "Cosine",
-            },
-        });
+    if (!searchResult.points || searchResult.points.length === 0) {
+      return res.status(404).send("No relevant context found in the document.");
+    }
 
-        // ----------------------------------------------
-        // 7. Create embeddings
-        // ----------------------------------------------
+    // ----------------------------------------------
+    // 12. Get best matching chunk
+    // ----------------------------------------------
 
-        const embeddingPromises = chunks.map(async (chunk) => {
-            const embedding = await createEmbedding(chunk);
+    const bestChunk = searchResult.points[0].payload.text;
 
-            return {
-                id: crypto.randomUUID(),
+    console.log("Best matching chunk:");
+    console.log(bestChunk);
 
-                vector: embedding,
+    // ----------------------------------------------
+    // 13. Ask Gemini using retrieved context
+    // ----------------------------------------------
 
-                payload: {
-                    text: chunk,
-                },
-            };
-        });
+    const response = await ai.models.generateContent({
+      model: "gemini-3.5-flash-lite",
 
-        const points = await Promise.all(embeddingPromises);
-
-        console.log(`Generated ${points.length} embeddings`);
-
-        // ----------------------------------------------
-        // 8. Store embeddings in Qdrant
-        // ----------------------------------------------
-
-        await qdrant.upsert("pdf-docs", {
-            wait: true,
-            points,
-        });
-
-        console.log("Embeddings stored in Qdrant");
-
-        // ----------------------------------------------
-        // 9. Get user's question
-        // ----------------------------------------------
-
-        const question = req.body.question;
-
-        if (!question) {
-            return res.status(400).send("No question provided.");
-        }
-
-        // ----------------------------------------------
-        // 10. Create embedding for question
-        // ----------------------------------------------
-
-        const questionEmbedding = await createEmbedding(question);
-
-        // ----------------------------------------------
-        // 11. Search Qdrant
-        // ----------------------------------------------
-
-        const searchResult = await qdrant.query("pdf-docs", {
-            query: questionEmbedding,
-            limit: 1,
-            with_payload: true,
-        });
-
-        if (
-            !searchResult.points ||
-            searchResult.points.length === 0
-        ) {
-            return res
-                .status(404)
-                .send("No relevant context found in the document.");
-        }
-
-        // ----------------------------------------------
-        // 12. Get best matching chunk
-        // ----------------------------------------------
-
-        const bestChunk =
-            searchResult.points[0].payload.text;
-
-        console.log("Best matching chunk:");
-        console.log(bestChunk);
-
-        // ----------------------------------------------
-        // 13. Ask Gemini using retrieved context
-        // ----------------------------------------------
-
-        const response = await ai.models.generateContent({
-            model: "gemini-3.5-flash-lite",
-
-            contents: `
+      contents: `
 Answer the question using only the context provided below.
 
 Context:
@@ -237,28 +222,23 @@ ${bestChunk}
 Question:
 ${question}
             `,
-        });
+    });
 
-        // ----------------------------------------------
-        // 14. Return answer
-        // ----------------------------------------------
+    // ----------------------------------------------
+    // 14. Return answer
+    // ----------------------------------------------
 
-        res.send(response.text);
-    } catch (err) {
-        console.error(err);
+    res.send(response.text);
+  } catch (err) {
+    console.error(err);
 
-        // Cleanup uploaded file if something fails
-        if (
-            req.file &&
-            fs.existsSync(req.file.path)
-        ) {
-            fs.unlinkSync(req.file.path);
-        }
-
-        res.status(500).send(
-            "Error processing request."
-        );
+    // Cleanup uploaded file if something fails
+    if (req.file && fs.existsSync(req.file.path)) {
+      fs.unlinkSync(req.file.path);
     }
+
+    res.status(500).send("Error processing request.");
+  }
 });
 
 // --------------------------------------------------
@@ -266,22 +246,20 @@ ${question}
 // -----------------------------------------------
 
 app.post("/create-collection", async (req, res) => {
-    try {
-        await qdrant.createCollection("pdf-docs", {
-            vectors: {
-                size: 3072,
-                distance: "Cosine",
-            },
-        });
+  try {
+    await qdrant.createCollection("pdf-docs", {
+      vectors: {
+        size: 3072,
+        distance: "Cosine",
+      },
+    });
 
-        res.send("Collection created.");
-    } catch (err) {
-        console.error(err);
+    res.send("Collection created.");
+  } catch (err) {
+    console.error(err);
 
-        res.status(500).send(
-            "Failed to create collection."
-        );
-    }
+    res.status(500).send("Failed to create collection.");
+  }
 });
 
 // --------------------------------------------------
@@ -289,5 +267,5 @@ app.post("/create-collection", async (req, res) => {
 // --------------------------------------------------
 
 app.listen(3000, () => {
-    console.log("Server is running on port 3000");
+  console.log("Server is running on port 3000");
 });
